@@ -1,6 +1,5 @@
-flask
-flask-cors
 fastapi
-uvicorn
-requests
-gunicorn
+uvicorn[standard]
+httpx
+aiofiles
+python-dotenv
