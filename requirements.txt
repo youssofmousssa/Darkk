@@ -1,5 +1,9 @@
 fastapi
 uvicorn[standard]
 httpx
-aiofiles
+aioredis
+pyjwt
+prometheus-client
+pybreaker
+pydantic
 python-dotenv
