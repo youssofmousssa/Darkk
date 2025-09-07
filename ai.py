@@ -1,388 +1,531 @@
-#!/usr/bin/env python3
-"""
-darkai_proxy.py
-Single-file FastAPI proxy integrating all DarkAI endpoints you provided.
-
-Features:
-- Endpoints: /api/{service_name} (POST) and /api/{service_name}/get (GET)
-- Accepts JSON, form-data, file uploads (serves files from /uploads/)
-- Retries with exponential backoff, per-service concurrency limits
-- CORS (configurable via env)
-- Transparent passthrough of upstream response (JSON or text)
-- Logging + graceful shutdown for httpx client
-- Config via environment variables
-
-Run:
-    DARKAI_BASE=https://sii3.moayman.top \
-    uvicorn darkai_proxy:app --host 0.0.0.0 --port 8000
-
-Note: Uploaded files are saved to UPLOAD_DIR and served at /uploads/<filename>.
-"""
-
+# main.py
 import os
-import sys
+import time
 import uuid
-import asyncio
+import hmac
+import hashlib
 import logging
-from typing import Dict, Any, Optional, List, Tuple
-
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
+import asyncio
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, Header, HTTPException, status, Depends, Response
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import httpx
-import aiofiles
-from dotenv import load_dotenv
+import aioredis
+import jwt
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+from starlette.concurrency import run_in_threadpool
+from pybreaker import CircuitBreaker, CircuitBreakerError
 
-load_dotenv()  # optional .env
+# --- Configuration and environment ---
 
-# ---------- Configuration ----------
-DARKAI_BASE = os.getenv("DARKAI_BASE", "https://sii3.moayman.top")
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/darkai_uploads")
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
-# Allowed origins: comma-separated list or "*" (default)
-if ALLOW_ORIGINS.strip() == "*" or ALLOW_ORIGINS.strip() == "":
-    ALLOW_ORIGINS_LIST = ["*"]
-else:
-    ALLOW_ORIGINS_LIST = [o.strip() for o in ALLOW_ORIGINS.split(",")]
+API_KEY_SECRET = os.getenv("API_KEY_SECRET", "supersecretapikeysecret")  # HMAC secret to validate API keys signatures
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretjwtsecret")
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_SECONDS = 900  # 15 mins
+JWT_REFRESH_TOKEN_EXPIRE_SECONDS = 604800  # 7 days
 
-EXT_TIMEOUT = float(os.getenv("EXT_TIMEOUT", "30"))  # seconds
-RETRIES = int(os.getenv("RETRIES", "2"))
-CONCURRENCY_PER_SERVICE = int(os.getenv("CONCURRENCY_PER_SERVICE", "6"))
-MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "50"))
-DARKAI_API_KEY = os.getenv("DARKAI_API_KEY", None)  # optional if backend requires key
+UPSTREAM_BASE_URL = "https://sii3.moayman.top"
+UPSTREAM_TIMEOUT = 15.0  # seconds
+REQUEST_ID_TTL_SECONDS = 300  # 5 minutes TTL for request ID dedupe in Redis
+HMAC_TIMESTAMP_SKEW = 120  # seconds allowed clock skew for signatures
+RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "10"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "100"))
+DAILY_QUOTA = int(os.getenv("DAILY_QUOTA", "10000"))
+MONTHLY_QUOTA = int(os.getenv("MONTHLY_QUOTA", "300000"))
 
-# Make uploads directory
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
 
-# ---------- Logging ----------
+# --- Logging setup ---
+
+logger = logging.getLogger("darkai_proxy")
 logging.basicConfig(
-    stream=sys.stdout,
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("darkai-proxy")
-
-# ---------- FastAPI app ----------
-app = FastAPI(title="DarkAI Unified Proxy", version="1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS_LIST,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    format='%(asctime)s %(levelname)s %(message)s',
 )
 
-# Serve uploaded files
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# --- Prometheus metrics ---
 
-# ---------- Upstream service mapping ----------
-# Maps service short key -> { path: <upstream path>, method: <"POST"|"GET">, note: <optional> }
-SERVICES = {
-    "gemini-img": {"path": "/api/gemini-img.php", "method": "POST"},
-    "flux-pro": {"path": "/api/flux-pro.php", "method": "POST"},
-    "gpt-img": {"path": "/api/gpt-img.php", "method": "POST"},
-    "nano-banana": {"path": "/api/nano-banana.php", "method": "POST"},
-    "img-cv": {"path": "/api/img-cv.php", "method": "POST"},
-    "voice": {"path": "/api/voice.php", "method": "POST"},
-    "veo3": {"path": "/api/veo3.php", "method": "POST"},
-    "music": {"path": "/api/music.php", "method": "POST"},
-    "create-music": {"path": "/api/create-music.php", "method": "POST"},
-    "wormgpt": {"path": "/DARK/api/wormgpt.php", "method": "POST"},
-    "do": {"path": "/api/do.php", "method": "GET"},  # downloader: GET with url param
-    "remove-bg": {"path": "/api/remove-bg.php", "method": "GET"},
-    "gemini-dark": {"path": "/api/gemini-dark.php", "method": "POST"},
-    "gemini": {"path": "/DARK/gemini.php", "method": "POST"},
-    "ai": {"path": "/api/ai.php", "method": "POST"},
-}
+REQUEST_COUNT = Counter(
+    "darkai_proxy_requests_total",
+    "Total API requests processed",
+    ['endpoint', 'method', 'status_code']
+)
+REQUEST_LATENCY = Histogram(
+    "darkai_proxy_request_latency_seconds",
+    "Latency for API requests",
+    ['endpoint']
+)
 
-# Create semaphores per service to limit concurrent upstream calls
-_semaphores: Dict[str, asyncio.Semaphore] = {
-    k: asyncio.Semaphore(CONCURRENCY_PER_SERVICE) for k in SERVICES.keys()
-}
+# --- FastAPI app and middleware ---
 
-# HTTPX async client
-_client: Optional[httpx.AsyncClient] = None
+app = FastAPI(title="DarkAI Unified Proxy API")
+
+# Force HTTPS redirection middleware
+app.add_middleware(HTTPSRedirectMiddleware)
 
 
-def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        limits = httpx.Limits(max_connections=MAX_CONNECTIONS, max_keepalive_connections=20)
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(EXT_TIMEOUT), limits=limits)
-    return _client
+# --- Redis client global ---
+redis = None
+
+async def get_redis():
+    global redis
+    if redis is None:
+        redis = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    return redis
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _client
-    if _client:
-        await _client.aclose()
-        _client = None
-        logger.info("HTTPX client closed.")
+# --- Security Utilities ---
 
-
-# ---------- Helpers ----------
-async def save_upload_and_get_public_url(upload: UploadFile, request: Request) -> str:
+def verify_hmac_signature(secret: str, signature: str, timestamp: str, method: str, path: str, body: bytes) -> bool:
     """
-    Save UploadFile to UPLOAD_DIR and return absolute public URL (based on request.base_url).
-    NOTE: For upstream servers to be able to fetch it, this URL must be publicly reachable.
+    Verify HMAC_SHA256 signature with scheme:
+    signature_base = timestamp + '\n' + method + '\n' + path + '\n' + body_hash
+    X-Signature = HMAC_SHA256(secret, signature_base)
     """
-    suffix = os.path.splitext(upload.filename)[1] or ""
-    fname = f"{uuid.uuid4().hex}{suffix}"
-    dest = os.path.join(UPLOAD_DIR, fname)
     try:
-        async with aiofiles.open(dest, "wb") as out_f:
-            content = await upload.read()
-            await out_f.write(content)
-    finally:
-        await upload.close()
-    base = str(request.base_url).rstrip("/")
-    public_url = f"{base}/uploads/{fname}"
-    logger.info("Saved upload %s -> %s", upload.filename, public_url)
-    return public_url
+        body_hash = hashlib.sha256(body if body else b'').hexdigest()
+        signature_base = f"{timestamp}\n{method.upper()}\n{path}\n{body_hash}".encode()
+        computed_hmac = hmac.new(secret.encode(), signature_base, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(computed_hmac, signature)
+    except Exception as e:
+        logger.error(f"Failed signature verification: {e}")
+        return False
 
+def create_jwt_token(data: dict, expires_in: int) -> str:
+    payload = data.copy()
+    payload.update({"exp": time.time() + expires_in})
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token
 
-def build_upstream_url(service_key: str) -> str:
-    conf = SERVICES[service_key]
-    return DARKAI_BASE.rstrip("/") + conf["path"]
+def decode_jwt_token(token: str) -> dict:
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return decoded
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid JWT token")
 
+# --- API Key Data Model ---
 
-async def _attempt_request(
-    service_key: str,
-    data: Dict[str, Any],
-    params: Dict[str, Any],
-    files: Optional[Dict[str, bytes]],
-    json_body: Optional[Dict[str, Any]],
-) -> httpx.Response:
+class APIKeyData(BaseModel):
+    client_id: str
+    secret: str
+    allowed_ips: Optional[list] = None
+    revoked: bool = False
+    daily_quota_used: int = 0
+    monthly_quota_used: int = 0
+
+# --- In-memory API key store (demo only - replace with persistent DB) ---
+
+# For production, use persistent DB and Vault for secrets
+api_keys_store: Dict[str, APIKeyData] = {}
+
+# --- Authentication & Authorization Dependencies ---
+
+async def get_api_key(x_api_key: str = Header(...), client_ip: Optional[str] = None) -> APIKeyData:
     """
-    Single attempt to call upstream. We use method from SERVICES mapping.
-    `data` -> form data
-    `params` -> query params for GET
-    `files` -> for multipart (not often needed here, upstream usually expects url links)
-    `json_body` -> if sending JSON
+    Validate API key header, check revocation and IP allowlist.
     """
-    url = build_upstream_url(service_key)
-    method = SERVICES[service_key]["method"].upper()
-    client = get_client()
-    headers = {}
-    if DARKAI_API_KEY:
-        # optional header if upstream requires it — customize as needed
-        headers["Authorization"] = f"Bearer {DARKAI_API_KEY}"
+    key_data = api_keys_store.get(x_api_key)
+    if not key_data or key_data.revoked:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked API key")
+    if key_data.allowed_ips:
+        if client_ip is None or client_ip not in key_data.allowed_ips:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="IP not allowed for this API key")
+    return key_data
 
-    # Choose request style based on method and presence of json_body
-    if method == "GET":
-        logger.debug("Upstream GET %s params=%s", url, params)
-        resp = await client.get(url, params=params, headers=headers)
-        return resp
-    else:
-        # prefer POST form data (most upstream examples use form fields like 'text' and 'link')
-        if json_body is not None:
-            logger.debug("Upstream POST JSON %s json=%s", url, json_body)
-            resp = await client.post(url, json=json_body, headers=headers)
-            return resp
-        else:
-            # Use data for form fields; include files if provided (multipart)
-            if files:
-                # prepare files mapping for httpx: {fieldname: (filename, data, content_type)}
-                files_payload = {k: (v["filename"], v["content"], v.get("content_type", "application/octet-stream")) for k, v in files.items()}
-                logger.debug("Upstream POST multipart %s data=%s files=%s", url, list(data.keys()), list(files_payload.keys()))
-                resp = await client.post(url, data=data, files=files_payload, headers=headers)
-                return resp
-            else:
-                logger.debug("Upstream POST form %s data=%s", url, list(data.keys()))
-                resp = await client.post(url, data=data, headers=headers)
-                return resp
+security = HTTPBearer()
 
+async def get_current_user(token: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Validate JWT bearer token for user session.
+    """
+    token_str = token.credentials
+    user_data = decode_jwt_token(token_str)
+    return user_data
 
-async def call_upstream_with_retries(service_key: str, data: Dict[str, Any], params: Dict[str, Any], files: Optional[Dict[str, bytes]], json_body: Optional[Dict[str, Any]]):
-    last_exc = None
-    for attempt in range(RETRIES + 1):
+# --- Request Integrity Middleware ---
+
+class RequestIntegrityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Extract and verify required headers
+        x_request_id = request.headers.get("X-Request-ID")
+        x_signature = request.headers.get("X-Signature")
+        x_timestamp = request.headers.get("X-Timestamp")
+        x_api_key = request.headers.get("x-api-key")
+        client_ip = request.client.host if request.client else None
+
+        # Validate presence
+        if not x_api_key:
+            return JSONResponse(status_code=401, content={"error": "Missing x-api-key header"})
+        if not x_request_id:
+            return JSONResponse(status_code=400, content={"error": "Missing X-Request-ID header"})
+        if not x_signature:
+            return JSONResponse(status_code=401, content={"error": "Missing X-Signature header"})
+        if not x_timestamp:
+            return JSONResponse(status_code=400, content={"error": "Missing X-Timestamp header"})
+
+        # Validate timestamp skew
         try:
-            resp = await _attempt_request(service_key, data, params, files, json_body)
-            # treat HTTP < 400 as success
-            if resp.status_code < 400:
-                return resp
-            else:
-                logger.warning("Upstream %s returned status %s: %s", service_key, resp.status_code, resp.text[:200])
-                last_exc = RuntimeError(f"Upstream returned {resp.status_code}")
+            ts_int = int(x_timestamp)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": "Invalid X-Timestamp header"})
+        now = int(time.time())
+        if abs(now - ts_int) > HMAC_TIMESTAMP_SKEW:
+            return JSONResponse(status_code=400, content={"error": "Request timestamp out of allowed range"})
+
+        # Check API key existence and IP allowlist
+        key_data = api_keys_store.get(x_api_key)
+        if not key_data or key_data.revoked:
+            return JSONResponse(status_code=401, content={"error": "Invalid or revoked API key"})
+        if key_data.allowed_ips and client_ip not in key_data.allowed_ips:
+            return JSONResponse(status_code=403, content={"error": "IP not allowed for this API key"})
+
+        # Check replay of X-Request-ID
+        redis = await get_redis()
+        request_id_key = f"request_id:{x_request_id}"
+        is_duplicate = await redis.get(request_id_key)
+        if is_duplicate:
+            return JSONResponse(status_code=409, content={"error": "Duplicate X-Request-ID detected"})
+        await redis.set(request_id_key, "1", ex=REQUEST_ID_TTL_SECONDS)
+
+        # Read body for signature verification
+        body_bytes = await request.body()
+
+        # Verify HMAC signature
+        valid_signature = verify_hmac_signature(
+            secret=key_data.secret,
+            signature=x_signature,
+            timestamp=x_timestamp,
+            method=request.method,
+            path=request.url.path,
+            body=body_bytes
+        )
+        if not valid_signature:
+            return JSONResponse(status_code=401, content={"error": "Invalid HMAC signature"})
+
+        # Replace request stream for downstream handlers since we read body
+        async def receive():
+            return {"type": "http.request", "body": body_bytes}
+        request._receive = receive
+
+        # Rate limiting check
+        # Implement per-key and per-IP rate limiting using Redis
+        # Key format: ratelimit:{api_key} and ratelimit:{api_key}:{client_ip}
+        try:
+            # Simple token bucket algorithm using Lua script or atomic Redis commands
+            # Here: simplistic approach - increment counters with expiry
+            api_key_rl_key = f"ratelimit:{x_api_key}"
+            api_key_ip_rl_key = f"ratelimit:{x_api_key}:{client_ip}"
+
+            # Increment counters
+            current_count_key = await redis.incr(api_key_rl_key)
+            if current_count_key == 1:
+                await redis.expire(api_key_rl_key, 1)  # 1 second window
+
+            current_count_ip_key = await redis.incr(api_key_ip_rl_key)
+            if current_count_ip_key == 1:
+                await redis.expire(api_key_ip_rl_key, 1)
+
+            # Check limits
+            if current_count_key > RATE_LIMIT_BURST or current_count_ip_key > RATE_LIMIT_BURST:
+                retry_after = await redis.ttl(api_key_rl_key)
+                headers = {"Retry-After": str(retry_after if retry_after > 0 else 1)}
+                return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"}, headers=headers)
         except Exception as e:
-            logger.exception("Exception calling upstream (attempt %d/%d) for %s: %s", attempt + 1, RETRIES + 1, service_key, str(e))
-            last_exc = e
-        # backoff
-        backoff = (2 ** attempt) * 0.5
-        await asyncio.sleep(backoff)
-    # all attempts failed
-    raise HTTPException(status_code=502, detail=f"Upstream {service_key} failed after retries. Last error: {last_exc}")
+            logger.error(f"Rate limiting error: {e}")
+            # Fail open on Redis error
+
+        # Attach key_data and client_ip to request.state for downstream use
+        request.state.api_key_data = key_data
+        request.state.client_ip = client_ip
+        request.state.x_request_id = x_request_id
+
+        # Proceed to next middleware / route handler
+        response = await call_next(request)
+        return response
+
+app.add_middleware(RequestIntegrityMiddleware)
 
 
-def extract_resp_content(resp: httpx.Response):
-    ctype = resp.headers.get("content-type", "")
-    # JSON
-    if "application/json" in ctype or resp.text.strip().startswith("{"):
-        try:
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
-        except Exception:
-            # fallback to plain text
-            return PlainTextResponse(content=resp.text, status_code=resp.status_code)
-    # image or binary or other
-    elif ctype.startswith("image/") or "octet-stream" in ctype:
-        # return direct JSON with url if upstream returned JSON containing url
-        try:
-            j = resp.json()
-            return JSONResponse(content=j, status_code=resp.status_code)
-        except Exception:
-            # upstream returned raw image bytes - return textual base64 is one option,
-            # but we will return upstream text or binary as plain text to avoid accidental binary streaming in JSON.
-            return PlainTextResponse(content=resp.text, status_code=resp.status_code, media_type=ctype)
-    else:
-        return PlainTextResponse(content=resp.text, status_code=resp.status_code)
+# --- Circuit Breaker for upstream calls ---
 
+circuit_breaker = CircuitBreaker(
+    fail_max=5,
+    reset_timeout=60,
+    exclude=[httpx.HTTPStatusError]  # Only trip on network errors, not HTTP errors
+)
 
-# ---------- API Endpoints ----------
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service_count": len(SERVICES)}
+# --- Upstream proxy call with retry and circuit breaker ---
 
-
-@app.post("/api/{service_name}")
-async def proxy_post(service_name: str, request: Request):
-    """
-    Generic POST proxy endpoint for all services.
-    Accepts:
-      - application/json with body -> forwarded as JSON (json_body)
-      - form-data (including UploadFile fields) -> forwarded as form data (and files served locally and forwarded as 'link'/'links')
-    Behavior:
-      - if you upload files: they'll be saved to /uploads/ and their public URLs added to payload:
-          * for multiple files -> 'links' param (comma-separated) OR preserve field name if provided
-          * for a single file -> 'link' param if no other 'link' provided
-      - All other form fields are forwarded as-is.
-    """
-    service_name = service_name.strip()
-    if service_name not in SERVICES:
-        raise HTTPException(status_code=404, detail=f"Service {service_name} not found. Available: {list(SERVICES.keys())}")
-
-    # Acquire semaphore for service
-    sem = _semaphores[service_name]
-    async with sem:
-        content_type = request.headers.get("content-type", "")
-        data = {}
-        params = {}
-        files_payload = None
-        json_body = None
-        uploaded_urls: List[str] = []
-
-        # If JSON body -> forward as JSON
-        if "application/json" in content_type:
-            json_body = await request.json()
-        else:
-            # parse form
-            form = await request.form()
-            # form is a starlette.datastructures.FormData (iterable)
-            for key, value in form.multi_items():
-                # UploadFile instances (form files) will be of UploadFile type
-                if isinstance(value, UploadFile):
-                    # save and get public URL
-                    public_url = await save_upload_and_get_public_url(value, request)
-                    uploaded_urls.append(public_url)
-                else:
-                    # multiple values for same key? keep last (like regular form)
-                    data[key] = str(value)
-
-        # If we saved uploads, decide where to put them in payload
-        if uploaded_urls:
-            # if upstream expects 'links' param for multiple images (nano-banana etc.) prefer that
-            if "links" in data or len(uploaded_urls) > 1:
-                # merge with existing 'links' if present
-                existing = data.get("links", "")
-                combined = ",".join([existing] + uploaded_urls) if existing else ",".join(uploaded_urls)
-                data["links"] = combined
+async def call_upstream(
+    method: str,
+    path: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, str]] = None,
+    data: Optional[Dict[str, Any]] = None,
+    timeout: float = UPSTREAM_TIMEOUT,
+) -> httpx.Response:
+    url = UPSTREAM_BASE_URL + path
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        @circuit_breaker
+        async def do_request():
+            if method.upper() == "GET":
+                return await client.get(url, headers=headers, params=params)
+            elif method.upper() == "POST":
+                return await client.post(url, headers=headers, data=data)
             else:
-                # single file: set 'link' unless user already supplied link
-                if "link" not in data:
-                    data["link"] = uploaded_urls[0]
-                else:
-                    # user supplied link and uploaded file(s) as well -> append to 'links'
-                    data["links"] = ",".join([data.get("link")] + uploaded_urls)
+                raise HTTPException(status_code=405, detail="Method not allowed")
 
-        # Some specific behaviors: if service 'do' (downloader) expects 'url' param, allow both 'url' and 'link'
-        if service_name == "do":
-            # ensure there is a 'url' parameter
-            if "url" not in data and "link" in data:
-                data["url"] = data["link"]
+        # Retry with exponential backoff on transient errors
+        for attempt in range(3):
+            try:
+                response = await do_request()
+                response.raise_for_status()
+                return response
+            except CircuitBreakerError:
+                raise HTTPException(status_code=503, detail="Upstream service temporarily unavailable (circuit breaker open)")
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                if attempt == 2:
+                    raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}")
+                await asyncio.sleep(2 ** attempt)
+        raise HTTPException(status_code=502, detail="Upstream request failed after retries")
 
-        # Now call upstream with retries
-        resp = await call_upstream_with_retries(service_name, data, params, files_payload, json_body)
+# --- Cache for GET image/video requests (simple Redis cache) ---
 
-        return extract_resp_content(resp)
+async def get_cache(key: str) -> Optional[str]:
+    redis = await get_redis()
+    return await redis.get(key)
 
+async def set_cache(key: str, value: str, ttl: int = 300):
+    redis = await get_redis()
+    await redis.set(key, value, ex=ttl)
 
-@app.get("/api/{service_name}/get")
-async def proxy_get(service_name: str, request: Request):
-    """
-    Generic GET proxy wrapper that forwards query parameters as-is to the upstream GET endpoint.
-    Example: /api/veo3/get?text=Create+a+cinematic+intro
-    """
-    service_name = service_name.strip()
-    if service_name not in SERVICES:
-        raise HTTPException(status_code=404, detail=f"Service {service_name} not found.")
-    if SERVICES[service_name]["method"].upper() not in ("GET", "POST"):
-        # We'll still allow GET forwarding; upstream may accept GET even if examples showed POST
-        pass
+# --- Structured Logging Middleware ---
 
-    sem = _semaphores[service_name]
-    async with sem:
+class StructuredLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        response = await call_next(request)
+        process_time = time.time() - start_time
+
+        api_key = getattr(request.state, "api_key_data", None)
+        key_id = api_key.client_id if api_key else "unknown"
+        user_id = None
+        if hasattr(request.state, "user"):
+            user_id = getattr(request.state.user, "id", None)
+        request_id = getattr(request.state, "x_request_id", None)
+        client_ip = getattr(request.state, "client_ip", None)
+
+        log_data = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "api_key": key_id,
+            "user_id": user_id,
+            "request_id": request_id,
+            "path": request.url.path,
+            "method": request.method,
+            "status_code": response.status_code,
+            "latency_ms": int(process_time * 1000),
+            "client_ip": client_ip,
+        }
+        logger.info(f"RequestLog: {log_data}")
+
+        # Update Prometheus metrics
+        REQUEST_COUNT.labels(endpoint=request.url.path, method=request.method, status_code=str(response.status_code)).inc()
+        REQUEST_LATENCY.labels(endpoint=request.url.path).observe(process_time)
+
+        return response
+
+app.add_middleware(StructuredLoggingMiddleware)
+
+# --- Authentication endpoints to register API keys and issue JWTs ---
+
+class RegisterRequest(BaseModel):
+    client_id: str
+
+class TokenRequest(BaseModel):
+    client_id: str
+    api_key: str
+
+@app.post("/auth/register")
+async def register_api_key(req: RegisterRequest):
+    # In production, secure this endpoint (admin only)
+    # Generate API key and secret (HMAC secret)
+    api_key = str(uuid.uuid4())
+    secret = hashlib.sha256(os.urandom(32)).hexdigest()
+    api_keys_store[api_key] = APIKeyData(client_id=req.client_id, secret=secret)
+    return {"api_key": api_key, "secret": secret}
+
+@app.post("/auth/token")
+async def issue_jwt_token(req: TokenRequest):
+    key_data = api_keys_store.get(req.api_key)
+    if not key_data or key_data.client_id != req.client_id or key_data.revoked:
+        raise HTTPException(status_code=401, detail="Invalid API key or client ID")
+
+    access_token = create_jwt_token({"client_id": req.client_id}, JWT_ACCESS_TOKEN_EXPIRE_SECONDS)
+    refresh_token = create_jwt_token({"client_id": req.client_id, "refresh": True}, JWT_REFRESH_TOKEN_EXPIRE_SECONDS)
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+# --- Proxy routes for all services ---
+
+# Map proxy routes to upstream paths
+SERVICE_PATHS = {
+    "gemini-img": "/api/gemini-img.php",
+    "flux-pro": "/api/flux-pro.php",
+    "gpt-img": "/api/gpt-img.php",
+    "nano-banana": "/api/nano-banana.php",
+    "img-cv": "/api/img-cv.php",
+    "voice": "/api/voice.php",
+    "veo3": "/api/veo3.php",
+    "music": "/api/music.php",
+    "create-music": "/api/create-music.php",
+    "wormgpt": "/DARK/api/wormgpt.php",
+    "ai": "/api/ai.php",
+    "gemini-dark": "/api/gemini-dark.php",
+    "gemini": "/DARK/gemini.php",
+    "do": "/api/do.php",
+    "remove-bg": "/api/remove-bg.php",
+}
+
+@app.api_route("/api/{service_name}", methods=["GET", "POST"])
+async def proxy_service(
+    service_name: str,
+    request: Request,
+    api_key_data: APIKeyData = Depends(get_api_key)
+):
+    if service_name not in SERVICE_PATHS:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    path = SERVICE_PATHS[service_name]
+
+    # Prepare headers for upstream call
+    upstream_headers = {
+        "User-Agent": "DarkAI-Proxy/1.0",
+        # Inject proxy request id header
+        "X-Proxy-Request-Id": request.headers.get("X-Request-ID", str(uuid.uuid4())),
+        # Add any upstream auth headers here if required (e.g. HMAC with upstream secret)
+    }
+
+    # Forward client headers except auth headers
+    # Here we explicitly set required headers only for clarity
+    # Also forward content-type for POSTs
+    if request.method == "POST":
+        content_type = request.headers.get("content-type")
+        if content_type:
+            upstream_headers["Content-Type"] = content_type
+
+    # Handle GET and POST parameters
+    if request.method == "GET":
         params = dict(request.query_params)
-        # special: if service is 'do' and param is 'url' already present it's fine
-        resp = await call_upstream_with_retries(service_name, data={}, params=params, files=None, json_body=None)
-        return extract_resp_content(resp)
-
-
-@app.get("/services")
-async def list_services():
-    """
-    Return simple list of available services and example usage.
-    """
-    sample_base = "/api/<service> (POST) or /api/<service>/get (GET)"
-    return {"available_services": list(SERVICES.keys()), "usage": sample_base}
-
-
-# ---------- Example convenience endpoints for common flows ----------
-@app.post("/api/generate-image")
-async def generate_image_proxy(request: Request):
-    """
-    Convenience endpoint:
-    - expects form/json field 'model' (e.g., 'flux-pro', 'gpt-img', 'gemini-img', 'img-cv', 'nano-banana')
-    - expects 'text' and either 'link' (URL) or file uploads (images)
-    Forwards to the chosen service.
-    """
-    form_or_json_content_type = request.headers.get("content-type", "")
-    payload = {}
-    if "application/json" in form_or_json_content_type:
-        payload = await request.json()
+        data = None
     else:
         form = await request.form()
-        for k, v in form.multi_items():
-            if not isinstance(v, UploadFile):
-                payload[k] = v
-    model = payload.get("model")
-    if not model:
-        raise HTTPException(status_code=400, detail="Please provide 'model' (e.g., 'flux-pro', 'gpt-img', 'gemini-img')")
-    if model not in SERVICES:
-        raise HTTPException(status_code=404, detail=f"Model '{model}' not supported by proxy.")
-    # Reuse proxy_post logic by delegating; create a fake request with same body is complicated,
-    # so instruct caller to hit /api/{model} directly. We return helpful guidance instead.
-    return JSONResponse({
-        "info": "Use /api/{model} directly. Example:",
-        "curl_example_form": f"curl -X POST 'http://<your_host>/api/{model}' -F 'text=Make+icon+gold' -F 'link=https://example.com/img.png'",
-        "note": "If uploading files, ensure server is publicly reachable so upstream can fetch /uploads/ URLs."
-    })
+        params = None
+        data = dict(form)
+
+    # Cache GET image/video requests (idempotent)
+    cache_key = None
+    cached_response = None
+    if request.method == "GET" and service_name in {"gemini-img", "flux-pro", "gpt-img", "nano-banana", "img-cv", "voice", "veo3", "music", "create-music", "do", "remove-bg"}:
+        # Cache key by service + sorted query params string
+        sorted_params = sorted(params.items()) if params else []
+        cache_key = f"cache:{service_name}:" + hashlib.sha256(str(sorted_params).encode()).hexdigest()
+        cached_response = await get_cache(cache_key)
+        if cached_response:
+            return JSONResponse(content=eval(cached_response))  # eval is safe here because stored dict string, for demo only
+
+    # Call upstream service with retry and circuit breaker
+    try:
+        response = await call_upstream(
+            method=request.method,
+            path=path,
+            headers=upstream_headers,
+            params=params,
+            data=data
+        )
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+
+    # Stream response back to client
+    content = response.content
+    content_type = response.headers.get("content-type", "application/json")
+
+    # Cache GET JSON responses for idempotent endpoints
+    if cache_key and response.status_code == 200 and "application/json" in content_type:
+        await set_cache(cache_key, content.decode(), ttl=300)
+
+    return Response(content=content, media_type=content_type)
 
 
-# ---------- Run block ----------
-if __name__ == "__main__":
-    import uvicorn
+# --- Fallback raw proxy for any other paths under /proxy/ ---
 
-    logger.info("Starting DarkAI proxy with base %s", DARKAI_BASE)
-    uvicorn.run("darkai_proxy:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level="info")
+@app.api_route("/proxy/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def proxy_raw(
+    full_path: str,
+    request: Request,
+    api_key_data: APIKeyData = Depends(get_api_key)
+):
+    path = f"/{full_path}"
+    upstream_headers = {
+        "User-Agent": "DarkAI-Proxy/1.0",
+        "X-Proxy-Request-Id": request.headers.get("X-Request-ID", str(uuid.uuid4())),
+    }
+
+    if request.method == "POST":
+        content_type = request.headers.get("content-type")
+        if content_type:
+            upstream_headers["Content-Type"] = content_type
+
+    if request.method == "GET":
+        params = dict(request.query_params)
+        data = None
+    else:
+        form = await request.form()
+        params = None
+        data = dict(form)
+
+    try:
+        response = await call_upstream(
+            method=request.method,
+            path=path,
+            headers=upstream_headers,
+            params=params,
+            data=data
+        )
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+
+    return Response(content=response.content, media_type=response.headers.get("content-type", "application/json"))
+
+
+# --- Prometheus metrics endpoint ---
+
+@app.get("/metrics")
+async def metrics():
+    data = generate_latest()
+    return Response(data, media_type=CONTENT_TYPE_LATEST)
+
+
+# --- Admin endpoints for API key management (demo only, protect in prod) ---
+
+@app.get("/admin/api-keys")
+async def list_api_keys():
+    # Return list of keys with client ids and revoked status
+    keys_list = []
+    for k, v in api_keys_store.items():
+        keys_list.append({"api_key": k, "client_id": v.client_id, "revoked": v.revoked})
+    return {"keys": keys_list}
+
+class APIKeyRevokeRequest(BaseModel):
+    api_key: str
+
+@app.post("/admin/api-keys/revoke")
+async def revoke_api_key(req: APIKeyRevokeRequest):
+    key_data = api_keys_store.get(req.api_key)
+    if not key_data:
+        raise HTTPException(status_code=404, detail="API key not found")
+    key_data.revoked = True
+    ret
